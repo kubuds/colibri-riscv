@@ -24,6 +24,9 @@
 #if (defined(__AVX2__) && defined(__FMA__)) || defined(__SSE4_1__)
 #include <immintrin.h>
 #endif
+#if defined(__riscv_vector)
+#include <riscv_vector.h>
+#endif
 #if defined(__SSE4_1__)
 #include "sse41_kernels.h"
 #endif
@@ -46,6 +49,17 @@ static inline float gs_group_sum_sse41(__m128 a0, __m128 a1) {
     a0 = _mm_add_ps(a0, _mm_movehl_ps(a0,a0));
     a0 = _mm_add_ss(a0, _mm_shuffle_ps(a0,a0,1));
     return _mm_cvtss_f32(a0);
+}
+#elif defined(__riscv_vector)
+/* RVV group fold (SpacemiT K3 / X100): add the two chunk accumulators and
+ * reduce with vfredusum -- an unordered sum, a genuinely different shape than
+ * the scalar tier's sequential fold, exactly like the SSE4.1 tier above. */
+static inline float gs_group_sum_rvv(vfloat32m2_t a0, vfloat32m2_t a1) {
+    size_t vm = __riscv_vsetvlmax_e32m2();
+    vfloat32m2_t s = __riscv_vfadd_vv_f32m2(a0, a1, vm);
+    vfloat32m1_t r = __riscv_vfmv_v_f_f32m1(0.f, 1);
+    r = __riscv_vfredusum_vs_f32m2_f32m1(s, r, vm);
+    return __riscv_vfmv_f_s_f32m1_f32(r);
 }
 #endif
 
@@ -188,6 +202,79 @@ static void matmul_q_gs(float *y, const float *x, const int8_t *q, const float *
                     a1 = COLIBRI_FMA(colibri_sse41_loadu_ps(x+i+4), _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(b0,4))), a1);
                 }
                 acc = fmaf(gs_group_sum_sse41(a0, a1), sc[gi], acc);
+            }
+            y[o] = acc;
+        }
+        return;
+    }
+#elif defined(__riscv_vector)
+    {   /* RVV tier (SpacemiT K3 / X100, VLEN=256): the SSE4.1 tier's shape at
+         * full vector width -- four output rows in flight, two chunk
+         * accumulators per row, one pinned fmaf per group. The int8 weights
+         * widen to i32 (vsext.vf4) and convert to f32 for vfmacc against the
+         * f32 activation. vsetvl carries every group tail: unlike the AVX2/
+         * SSE4.1 fixed-width loops no sub-chunk remainder is dropped (P5's
+         * tail-drop pin only governs those tiers; this one sums the whole
+         * group). New reduction shape like the SSE4.1 tier, so it is checked
+         * by tests/test_gsgemv.c with tolerance, not memcmp. */
+        int o4 = O & ~3;
+        #pragma omp parallel for schedule(static) if(O >= 256)
+        for (int ob = 0; ob < o4; ob += 4) {
+            const int8_t *w0 = q + (int64_t)(ob+0) * I, *w1 = q + (int64_t)(ob+1) * I;
+            const int8_t *w2 = q + (int64_t)(ob+2) * I, *w3 = q + (int64_t)(ob+3) * I;
+            const float *sc0 = scale + (int64_t)(ob+0) * ng, *sc1 = scale + (int64_t)(ob+1) * ng;
+            const float *sc2 = scale + (int64_t)(ob+2) * ng, *sc3 = scale + (int64_t)(ob+3) * ng;
+            float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+            for (int gi = 0; gi < ng; gi++) {
+                size_t vz = __riscv_vsetvlmax_e32m2();
+                vfloat32m2_t a00 = __riscv_vfmv_v_f_f32m2(0.f, vz), a01 = a00;
+                vfloat32m2_t a10 = a00, a11 = a00, a20 = a00, a21 = a00, a30 = a00, a31 = a00;
+                int base = gi * gs, end = base + gs; if (end > I) end = I;
+                int i = base, k = 0;
+                for (; i < end; k++) {
+                    size_t vl = __riscv_vsetvl_e32m2(end - i);
+                    vfloat32m2_t xl = __riscv_vle32_v_f32m2(x + i, vl);
+#define COLI_GS_RVV_ROW(a0, a1, w) do{                                         \
+                    vint8mf2_t   w8 = __riscv_vle8_v_i8mf2((w) + i, vl);        \
+                    vint32m2_t   wi = __riscv_vsext_vf4_i32m2(w8, vl);          \
+                    vfloat32m2_t wf = __riscv_vfcvt_f_x_v_f32m2(wi, vl);        \
+                    if (k & 1) (a1) = __riscv_vfmacc_vv_f32m2_tu((a1), xl, wf, vl); \
+                    else       (a0) = __riscv_vfmacc_vv_f32m2_tu((a0), xl, wf, vl); \
+                }while(0)
+                    COLI_GS_RVV_ROW(a00, a01, w0);
+                    COLI_GS_RVV_ROW(a10, a11, w1);
+                    COLI_GS_RVV_ROW(a20, a21, w2);
+                    COLI_GS_RVV_ROW(a30, a31, w3);
+#undef COLI_GS_RVV_ROW
+                    i += (int)vl;
+                }
+                acc0 = fmaf(gs_group_sum_rvv(a00, a01), sc0[gi], acc0);
+                acc1 = fmaf(gs_group_sum_rvv(a10, a11), sc1[gi], acc1);
+                acc2 = fmaf(gs_group_sum_rvv(a20, a21), sc2[gi], acc2);
+                acc3 = fmaf(gs_group_sum_rvv(a30, a31), sc3[gi], acc3);
+            }
+            y[ob+0] = acc0; y[ob+1] = acc1; y[ob+2] = acc2; y[ob+3] = acc3;
+        }
+        for (int o = o4; o < O; o++) {          /* at most three rows */
+            const int8_t *w = q + (int64_t)o * I;
+            const float *sc = scale + (int64_t)o * ng;
+            float acc = 0.f;
+            for (int gi = 0; gi < ng; gi++) {
+                size_t vz = __riscv_vsetvlmax_e32m2();
+                vfloat32m2_t a0 = __riscv_vfmv_v_f_f32m2(0.f, vz), a1 = a0;
+                int base = gi * gs, end = base + gs; if (end > I) end = I;
+                int i = base, k = 0;
+                for (; i < end; k++) {
+                    size_t vl = __riscv_vsetvl_e32m2(end - i);
+                    vfloat32m2_t xl = __riscv_vle32_v_f32m2(x + i, vl);
+                    vint8mf2_t   w8 = __riscv_vle8_v_i8mf2(w + i, vl);
+                    vint32m2_t   wi = __riscv_vsext_vf4_i32m2(w8, vl);
+                    vfloat32m2_t wf = __riscv_vfcvt_f_x_v_f32m2(wi, vl);
+                    if (k & 1) a1 = __riscv_vfmacc_vv_f32m2_tu(a1, xl, wf, vl);
+                    else       a0 = __riscv_vfmacc_vv_f32m2_tu(a0, xl, wf, vl);
+                    i += (int)vl;
+                }
+                acc = fmaf(gs_group_sum_rvv(a0, a1), sc[gi], acc);
             }
             y[o] = acc;
         }

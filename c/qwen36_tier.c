@@ -316,7 +316,18 @@ static void qt_aff_widen(const qt_affmask *saved){
     if(n<=1) return;
     qt_affmask all; memset(&all,0,sizeof all);
     for(long i=0;i<n && i<(long)(8*sizeof all.w);i++) all.w[i/(8*sizeof(unsigned long))] |= 1ul<<(i%(8*sizeof(unsigned long)));
-    syscall(SYS_sched_setaffinity,0,(size_t)saved->len,all.w);
+    if(syscall(SYS_sched_setaffinity,0,(size_t)saved->len,all.w)!=0){
+        /* Asymmetric SoCs (SpacemiT K3: 16 online harts but only the 8 X100 ones
+         * schedulable -- the A100 half refuses sched_setaffinity with EINVAL):
+         * the all-online mask fails as a whole, so grow it CPU by CPU and keep
+         * what sticks. */
+        qt_affmask cur; memset(&cur,0,sizeof cur);
+        for(long i=0;i<n && i<(long)(8*sizeof all.w);i++){
+            qt_affmask try=cur;
+            try.w[i/(8*sizeof(unsigned long))] |= 1ul<<(i%(8*sizeof(unsigned long)));
+            if(syscall(SYS_sched_setaffinity,0,(size_t)saved->len,try.w)==0) cur=try;
+        }
+    }
 }
 static void qt_aff_restore(const qt_affmask *saved){
     if(saved->len) syscall(SYS_sched_setaffinity,0,(size_t)saved->len,saved->w);

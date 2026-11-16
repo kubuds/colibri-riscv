@@ -1233,13 +1233,23 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
 #endif
                 for(; i+1<base+glen; i+=2){
                     uint8_t bg=wg[i>>1], bu=wu2[i>>1];
-                    ag+=(xs[i]*(float)((int)(bg&0xF)-8)+xs[i+1]*(float)((int)(bg>>4)-8))*scg;
-                    au+=(xs[i]*(float)((int)(bu&0xF)-8)+xs[i+1]*(float)((int)(bu>>4)-8))*scu;
+                    /* Same coli_fp_pin pinning as matmul_i4_grouped's scalar loop
+                     * in quant.h: every rounding point is pinned so this fused
+                     * twin cannot drift 1 ulp from the unfused one (the compiler
+                     * fuses per code shape otherwise -- test_i4_grouped). */
+                    float tg=coli_fp_pin(xs[i]*(float)((int)(bg&0xF)-8))
+                            +coli_fp_pin(xs[i+1]*(float)((int)(bg>>4)-8));
+                    float tu=coli_fp_pin(xs[i]*(float)((int)(bu&0xF)-8))
+                            +coli_fp_pin(xs[i+1]*(float)((int)(bu>>4)-8));
+                    ag=coli_fp_pin(coli_fp_pin(tg*scg)+ag);
+                    au=coli_fp_pin(coli_fp_pin(tu*scu)+au);
                 }
                 if(i<base+glen){
                     uint8_t bg=wg[i>>1], bu=wu2[i>>1];
-                    ag+=xs[i]*(float)((int)(bg&0xF)-8)*scg;
-                    au+=xs[i]*(float)((int)(bu&0xF)-8)*scu;
+                    float tg=coli_fp_pin(xs[i]*(float)((int)(bg&0xF)-8));
+                    float tu=coli_fp_pin(xs[i]*(float)((int)(bu&0xF)-8));
+                    ag=coli_fp_pin(coli_fp_pin(tg*scg)+ag);
+                    au=coli_fp_pin(coli_fp_pin(tu*scu)+au);
                 }
             }
             yg[(int64_t)s*O+o]=ag; yu[(int64_t)s*O+o]=au;
@@ -14145,8 +14155,17 @@ int main(int argc, char **argv){
           long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
           if(ncpu > CPU_SETSIZE) ncpu = CPU_SETSIZE;
           for(long i = 0; i < ncpu; i++) CPU_SET((int)i, &all);
-          if(sched_setaffinity(0, sizeof(all), &all) != 0)
-              perror("[OMP] sched_setaffinity pre-reexec (continuing)"); }
+          /* Asymmetric SoCs (SpacemiT K3: 16 online harts, only the 8 X100 ones
+           * schedulable -- the A100 half refuses sched_setaffinity with EINVAL):
+           * the all-online mask fails as a whole, so grow it CPU by CPU and keep
+           * what sticks. */
+          if(sched_setaffinity(0, sizeof(all), &all) != 0){
+              cpu_set_t cur; CPU_ZERO(&cur);
+              for(long i = 0; i < ncpu; i++){
+                  cpu_set_t try = cur; CPU_SET((int)i, &try);
+                  if(sched_setaffinity(0, sizeof(try), &try) == 0) cur = try;
+              }
+          } }
 #endif
         execv("/proc/self/exe", argv);         /* returns only on failure -> fall through and run untuned */
         perror("[OMP] execv self-reexec failed, running untuned");

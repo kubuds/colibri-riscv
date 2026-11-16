@@ -163,10 +163,11 @@ static int rows_match(int I, int O, int gs) {
     reference_gs_gemv(ref, x, q, sc, I, O, gs);
     matmul_q_gs(y, x, q, sc, I, O, gs);
 
-#if defined(__SSE4_1__) && !(defined(__AVX2__) && defined(__FMA__))
+#if (defined(__SSE4_1__) && !(defined(__AVX2__) && defined(__FMA__))) || defined(__riscv_vector)
     /* No FMA and a different tree reduction than the scalar reference: pure
      * relative error blows up on near-zero-ref rows (cancellation), so use a
-     * combined absolute+relative bound instead. */
+     * combined absolute+relative bound instead. The RVV tier is a new
+     * reduction shape for the same reason (vfredusum is unordered). */
     int equal = 1;
     for (int o = 0; o < O; o++) {
         float diff = fabsf(y[o] - ref[o]);

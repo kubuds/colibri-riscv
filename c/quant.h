@@ -20,6 +20,34 @@
 #include "sse41_kernels.h"
 #endif
 
+#if defined(__riscv_vector)
+/* RVV helpers (SpacemiT K3 / X100, VLEN=256) shared by the f32 GEMV tiers
+ * below. New reduction shapes like the NEON tier: the float tests check them
+ * with tolerance against the double reference (tests/test_olmoe_matmul_q.c),
+ * not bitwise. */
+static inline float coli_rvv_hsum_f32m2(vfloat32m2_t a0, vfloat32m2_t a1){
+    size_t vm=__riscv_vsetvlmax_e32m2();
+    vfloat32m2_t s=__riscv_vfadd_vv_f32m2(a0,a1,vm);
+    vfloat32m1_t r=__riscv_vfmv_v_f_f32m1(0.f,1);
+    return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m2_f32m1(s,r,vm));
+}
+/* one chunk of packed int4 pairs -> f32 weights in element order: byte j of
+ * the pair layout holds (e_2j, e_2j+1); zero-extend to u16 and assemble
+ * (t & 0x0F) | ((t & 0xF0) << 4) so the i8 view is [b_jl, b_jh] per lane --
+ * the lane-local trick of dot_i4i8 in idot.h. vl must be even. */
+static inline vfloat32m2_t coli_rvv_i4pair_f32(const uint8_t *w4, size_t vl){
+    size_t nb=vl/2;
+    vuint8mf4_t b8=__riscv_vle8_v_u8mf4(w4,nb);
+    vuint16mf2_t t=__riscv_vzext_vf2_u16mf2(b8,nb);
+    vuint16mf2_t n=__riscv_vor_vv_u16mf2(
+        __riscv_vand_vx_u16mf2(t,0x0F,nb),
+        __riscv_vsll_vx_u16mf2(__riscv_vand_vx_u16mf2(t,0xF0,nb),4,nb),nb);
+    vint8mf2_t w8=__riscv_vsub_vx_i8mf2(
+        __riscv_vreinterpret_v_u8mf2_i8mf2(__riscv_vreinterpret_v_u16mf2_u8mf2(n)),8,vl);
+    return __riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf4_i32m2(w8,vl),vl);
+}
+#endif
+
 /* ---- AVX-512 int4->float accumulator -------------------------------------- */
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 static int g_i4_acc512=1;
@@ -84,6 +112,23 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
             for(;i+8<=I;i+=8){ __m256i wi=_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(w+i)));
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i), _mm256_cvtepi32_ps(wi), acc); }
             a=hsum256(acc);
+#elif defined(__riscv_vector)
+            {   /* RVV tier (K3/X100): widen the int8 weights to f32 and vfmacc
+                 * against the activation; two chunk accumulators, vsetvl tail. */
+                size_t vz=__riscv_vsetvlmax_e32m2();
+                vfloat32m2_t ac0=__riscv_vfmv_v_f_f32m2(0.f,vz), ac1=ac0;
+                int k=0;
+                for(;i<I;k++){
+                    size_t vl=__riscv_vsetvl_e32m2(I-i);
+                    vfloat32m2_t xv=__riscv_vle32_v_f32m2(xs+i,vl);
+                    vint8mf2_t   w8=__riscv_vle8_v_i8mf2(w+i,vl);
+                    vfloat32m2_t wf=__riscv_vfcvt_f_x_v_f32m2(__riscv_vsext_vf4_i32m2(w8,vl),vl);
+                    if(k&1) ac1=__riscv_vfmacc_vv_f32m2_tu(ac1,xv,wf,vl);
+                    else    ac0=__riscv_vfmacc_vv_f32m2_tu(ac0,xv,wf,vl);
+                    i+=(int)vl;
+                }
+                a=coli_rvv_hsum_f32m2(ac0,ac1);
+            }
 #elif defined(__ARM_NEON)
             float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
             for(;i+8<=I;i+=8){ int16x8_t w16=vmovl_s8(vld1_s8(w+i));
@@ -115,6 +160,25 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
             a=hsum256(acc);
+#elif defined(__riscv_vector)
+            {   /* RVV tier (K3/X100): the lane-local nibble assemble of
+                 * dot_i4i8 (idot.h) into f32 weights, then vfmacc against the
+                 * activation; two chunk accumulators, vsetvl tail, and the
+                 * shared scalar loops below close an odd I. */
+                int even=I&~1;
+                size_t vz=__riscv_vsetvlmax_e32m2();
+                vfloat32m2_t ac0=__riscv_vfmv_v_f_f32m2(0.f,vz), ac1=ac0;
+                int k=0;
+                for(;i<even;k++){
+                    size_t vl=__riscv_vsetvl_e32m2(even-i);
+                    vfloat32m2_t xv=__riscv_vle32_v_f32m2(xs+i,vl);
+                    vfloat32m2_t wf=coli_rvv_i4pair_f32(w+(i>>1),vl);
+                    if(k&1) ac1=__riscv_vfmacc_vv_f32m2_tu(ac1,xv,wf,vl);
+                    else    ac0=__riscv_vfmacc_vv_f32m2_tu(ac0,xv,wf,vl);
+                    i+=(int)vl;
+                }
+                a=coli_rvv_hsum_f32m2(ac0,ac1);
+            }
 #elif defined(__ARM_NEON)
             const uint8x8_t m4=vdup_n_u8(0x0F); const int8x8_t b8=vdup_n_s8(8);
             float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
@@ -138,6 +202,25 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
 }
 
 /* ---- y[S,O] = x[S,I] @ W^T, W int4 packed + per-GROUP scales (fmt=4) ----- */
+/* coli_fp_pin: force a float value to round to its type NOW, so the compiler
+ * cannot fuse the surrounding multiply+add into an fma behind our back.
+ *
+ * Why it exists: `a += (x0*w0 + x1*w1) * sc` may be compiled as mul+mul+add+mul+add
+ * (four roundings) or with either product fused into an fma -- and WHICH shape
+ * gcc picks depends on the surrounding code. The fused and unfused twin kernels
+ * of the fmt=4 grouped path (matmul_i4_grouped here, matmul_i4_grouped_pair in
+ * colibri.c) drifted 1 ulp apart on gcc-15/riscv64 that way (test_i4_grouped).
+ * An empty asm with a "+f" operand is a no-op instruction-wise but pins the
+ * rounding point, exactly like the explicit _mm_mul_ps + _mm_add_ps pinning in
+ * sse41_kernels.h -- so this keeps the NON-fused canonical (the form x86 builds
+ * already produced) on every compiler. Cheap: no instruction is emitted. */
+static inline float coli_fp_pin(float x){
+#if defined(__GNUC__)
+    __asm__ volatile("" : "+f"(x));
+#endif
+    return x;
+}
+
 static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
                               int S, int I, int O, int gs){
     int rb=(I+1)/2; int ng=(I+gs-1)/gs;
@@ -181,8 +264,12 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
 #endif
                 for(; i<base+glen; i+=2){
                     if(i+1<base+glen){ uint8_t byte=w[i>>1];
-                        a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
-                    else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+                        float t=coli_fp_pin(xs[i]*(float)((int)(byte&0xF)-8))
+                               +coli_fp_pin(xs[i+1]*(float)((int)(byte>>4)-8));
+                        a=coli_fp_pin(coli_fp_pin(t*sc)+a); }
+                    else { uint8_t byte=w[i>>1];
+                        float t=coli_fp_pin(xs[i]*(float)((int)(byte&0xF)-8));
+                        a=coli_fp_pin(coli_fp_pin(t*sc)+a); }
                 }
             }
             y[(int64_t)s*O+o]=a;
@@ -214,6 +301,23 @@ static void matmul_i4_pair(float *yg, float *yu, const float *x,
             acc=_mm256_fmadd_ps(_mm256_loadu_ps(x+i),w0,acc);
             acc=_mm256_fmadd_ps(_mm256_loadu_ps(x+i+8),w1,acc); }
         a=hsum256(acc);
+#elif defined(__riscv_vector)
+        {   /* RVV tier (K3/X100): same shape as matmul_i4's RVV branch --
+             * lane-local nibble assemble (idot.h) to f32, vfmacc, vsetvl tail. */
+            int even=I&~1;
+            size_t vz=__riscv_vsetvlmax_e32m2();
+            vfloat32m2_t ac0=__riscv_vfmv_v_f_f32m2(0.f,vz), ac1=ac0;
+            int k=0;
+            for(;i<even;k++){
+                size_t vl=__riscv_vsetvl_e32m2(even-i);
+                vfloat32m2_t xv=__riscv_vle32_v_f32m2(x+i,vl);
+                vfloat32m2_t wf=coli_rvv_i4pair_f32(w+(i>>1),vl);
+                if(k&1) ac1=__riscv_vfmacc_vv_f32m2_tu(ac1,xv,wf,vl);
+                else    ac0=__riscv_vfmacc_vv_f32m2_tu(ac0,xv,wf,vl);
+                i+=(int)vl;
+            }
+            a=coli_rvv_hsum_f32m2(ac0,ac1);
+        }
 #elif defined(__ARM_NEON)
         const uint8x8_t m4=vdup_n_u8(0x0F); const int8x8_t b8=vdup_n_s8(8);
         float32x4_t ac0=vdupq_n_f32(0),ac1=vdupq_n_f32(0);

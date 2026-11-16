@@ -169,6 +169,9 @@ static inline float f16_to_f32(uint16_t h) {
 #if defined(__AVX2__) || defined(__SSE4_1__)
 #include <immintrin.h>
 #endif
+#if defined(__riscv_vector)
+#include <riscv_vector.h>
+#endif
 
 #if defined(__AVX2__)
 static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
@@ -210,6 +213,56 @@ static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
         if (m) for (int k = 0; k < 8; k++) if ((m >> k) & 1) dst[i+k] = f16_to_f32(src[i+k]);
     }
     for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
+}
+#elif defined(__riscv_vector)
+/* RVV tiers (SpacemiT K3 / X100, RVV 1.0 + Zvfbfmin/Zvfhmin).
+ * BF16 -> F32 is the same exact zero-pad widening as every other tier:
+ * zero-extend the u16 and shift left 16 -- no arithmetic, every bit pattern
+ * agrees with bf16_to_f32, so the vector tier cannot disagree with the scalar
+ * reference. F16 -> F32 uses the hardware vfwcvt (Zvfhmin, mandatory in
+ * RVA23) for everything -- exact for normals, subnormals and inf -- with the
+ * NaN lanes patched to the scalar reference's payload-preserving formula
+ * (vfwcvt canonicalizes NaNs). Exhaustive verification (all 65536 patterns)
+ * lives in tests/test_st_f16_bf16_simd.c. */
+static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+    for (; i < n; ) {
+        size_t vl = __riscv_vsetvl_e16m2(n - i);
+        vuint16m2_t h = __riscv_vle16_v_u16m2(src + i, vl);
+        vuint32m4_t w = __riscv_vsll_vx_u32m4(__riscv_vzext_vf2_u32m4(h, vl), 16, vl);
+        __riscv_vse32_v_u32m4((uint32_t *)(dst + i), w, vl);
+        i += (int64_t)vl;
+    }
+}
+static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+#if defined(__riscv_zvfhmin) || defined(__riscv_zvfh)
+    for (; i < n; ) {
+        size_t vl = __riscv_vsetvl_e16m2(n - i);
+        vuint16m2_t h = __riscv_vle16_v_u16m2(src + i, vl);
+        vuint32m4_t f = __riscv_vreinterpret_v_f32m4_u32m4(
+            __riscv_vfwcvt_f_f_v_f32m4(__riscv_vreinterpret_v_u16m2_f16m2(h), vl));
+        /* One caveat, exhaustive-checked by tests/test_st_f16_bf16_simd.c: vfwcvt
+         * CANONICALIZES NaNs (RISC-V conversion rule), while the scalar reference
+         * preserves sign | 0x7F800000 | (man << 13). Patch exactly those lanes
+         * (exp==0x1F && man!=0): rare in real weights, one vmerge when absent. */
+        vuint32m4_t h32  = __riscv_vzext_vf2_u32m4(h, vl);
+        vuint32m4_t exp  = __riscv_vand_vx_u32m4(__riscv_vsrl_vx_u32m4(h32, 10, vl), 0x1F, vl);
+        vuint32m4_t man  = __riscv_vand_vx_u32m4(h32, 0x3FF, vl);
+        vuint32m4_t sign = __riscv_vsll_vx_u32m4(__riscv_vand_vx_u32m4(h32, 0x8000, vl), 16, vl);
+        vbool8_t is_nan = __riscv_vmand_mm_b8(
+            __riscv_vmseq_vx_u32m4_b8(exp, 0x1F, vl),
+            __riscv_vmsne_vx_u32m4_b8(man, 0, vl), vl);
+        vuint32m4_t nan_bits = __riscv_vor_vv_u32m4(
+            __riscv_vor_vx_u32m4(sign, 0x7F800000u, vl),
+            __riscv_vsll_vx_u32m4(man, 13, vl), vl);
+        __riscv_vse32_v_u32m4((uint32_t *)(void *)(dst + i),
+            __riscv_vmerge_vvm_u32m4(f, nan_bits, is_nan, vl), vl);
+        i += (int64_t)vl;
+    }
+#else
+    for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
+#endif
 }
 #elif defined(__SSE4_1__)
 static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {

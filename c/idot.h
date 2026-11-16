@@ -50,6 +50,9 @@ static inline int hsum128_i32(__m128i v){
 #undef pixel
 #undef bool
 #endif
+#if defined(__riscv_vector)
+#include <riscv_vector.h>
+#endif
 
 
 /* ---- IDOT: integer dot kernels (int8-quantized activations) --------------- */
@@ -67,14 +70,42 @@ static inline int hsum128_i32(__m128i v){
 #define IDOT_KERNEL "neon"
 #elif defined(__VSX__)
 #define IDOT_KERNEL "vsx"
+#elif defined(__riscv_vector)
+#define IDOT_KERNEL "rvv"
 #else
 #define IDOT_KERNEL "scalar"
 #endif
 
 static inline float qrow_i8(const float *x, int8_t *q, int I){
-    float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
+    float amax=0; int i=0;
+#if defined(__riscv_vector)
+    {   /* RVV amax + RNE quantize; vfncvt rounds to nearest-even exactly like
+         * lrintf, and |x*inv| <= 127 by construction, so bit-identical. */
+        vfloat32m1_t seed=__riscv_vfmv_v_f_f32m1(0.f,1);
+        for(;i<I;){
+            size_t vl=__riscv_vsetvl_e32m2(I-i);
+            vfloat32m2_t v=__riscv_vfabs_v_f32m2(__riscv_vle32_v_f32m2(x+i,vl),vl);
+            seed=__riscv_vfredmax_vs_f32m2_f32m1(v,seed,vl);
+            i+=(int)vl;
+        }
+        amax=__riscv_vfmv_f_s_f32m1_f32(seed);
+    }
+#endif
+    for(;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
     float s=amax/127.f; if(s<1e-12f) s=1e-12f; float inv=1.f/s;
-    for(int i=0;i<I;i++) q[i]=(int8_t)lrintf(x[i]*inv);
+    i=0;
+#if defined(__riscv_vector)
+    for(;i<I;){
+        size_t vl=__riscv_vsetvl_e32m1(I-i);
+        vfloat32m1_t v=__riscv_vfmul_vf_f32m1(__riscv_vle32_v_f32m1(x+i,vl),inv,vl);
+        /* vfncvt narrows by exactly 2x: f32 -> i16 (RNE, like lrintf) -> i8.
+         * |x*inv| <= 127 so neither step saturates. */
+        vint16mf2_t t=__riscv_vfncvt_x_f_w_i16mf2(v,vl);
+        __riscv_vse8_v_i8mf4(q+i,__riscv_vncvt_x_x_w_i8mf4(t,vl),vl);
+        i+=(int)vl;
+    }
+#endif
+    for(;i<I;i++) q[i]=(int8_t)lrintf(x[i]*inv);
     return s;
 }
 
@@ -87,7 +118,18 @@ static inline float qrow_i8(const float *x, int8_t *q, int I){
 static float dense_act_i8(const float *x, int I, int8_t *xq, int32_t *xsg){
     float amax = 0.f;
     int i = 0;
-#if defined(__AVX2__)
+#if defined(__riscv_vector)
+    {   /* RVV amax: vfredmax per chunk into a lane-0 seed, exact float max. */
+        vfloat32m1_t seed=__riscv_vfmv_v_f_f32m1(0.f,1);
+        for(;i<I;){
+            size_t vl=__riscv_vsetvl_e32m2(I-i);
+            vfloat32m2_t v=__riscv_vfabs_v_f32m2(__riscv_vle32_v_f32m2(x+i,vl),vl);
+            seed=__riscv_vfredmax_vs_f32m2_f32m1(v,seed,vl);
+            i+=(int)vl;
+        }
+        amax=__riscv_vfmv_f_s_f32m1_f32(seed);
+    }
+#elif defined(__AVX2__)
     {
         __m256 am = _mm256_setzero_ps();
         const __m256 sign = _mm256_set1_ps(-0.0f);
@@ -108,7 +150,19 @@ static float dense_act_i8(const float *x, int I, int8_t *xq, int32_t *xsg){
     float s = amax / 127.f; if (s < 1e-12f) s = 1e-12f;
     float inv = 1.f / s;
     i = 0;
-#if defined(__AVX2__)
+#if defined(__riscv_vector)
+    {   /* vfncvt rounds to nearest-even, same as lrintf + the AVX2 packs below;
+         * |x*inv| <= 127 so the saturating narrow agrees with the C cast.
+         * vfncvt narrows 2x: f32 -> i16 (RNE) -> i8 (exact). */
+        for(;i<I;){
+            size_t vl=__riscv_vsetvl_e32m1(I-i);
+            vfloat32m1_t v=__riscv_vfmul_vf_f32m1(__riscv_vle32_v_f32m1(x+i,vl),inv,vl);
+            vint16mf2_t t=__riscv_vfncvt_x_f_w_i16mf2(v,vl);
+            __riscv_vse8_v_i8mf4(xq+i,__riscv_vncvt_x_x_w_i8mf4(t,vl),vl);
+            i+=(int)vl;
+        }
+    }
+#elif defined(__AVX2__)
     {
         const __m256 vinv = _mm256_set1_ps(inv);
         for (; i + 32 <= I; i += 32) {
@@ -141,7 +195,18 @@ static float dense_act_i8(const float *x, int I, int8_t *xq, int32_t *xsg){
         int ng = I / 64;
         for (int g = 0; g < ng; g++) {
             int32_t sum = 0;
+#if defined(__riscv_vector)
+            {   /* vwredsum widens 2x (i8 -> i16); a 64-lane block sum fits i16
+                 * (|sum| <= 8192), then one widen to i32. Exact either way. */
+                size_t vl=__riscv_vsetvl_e8m2(64);
+                vint8m2_t v=__riscv_vle8_v_i8m2(xq+(int64_t)g*64,vl);
+                vint16m1_t s16=__riscv_vwredsum_vs_i8m2_i16m1(
+                    v,__riscv_vmv_v_x_i16m1(0,1),vl);
+                sum=(int32_t)__riscv_vmv_x_s_i16m1_i16(s16);
+            }
+#else
             for (int k = 0; k < 64; k++) sum += xq[g * 64 + k];
+#endif
             xsg[g] = sum;
         }
     }
@@ -225,6 +290,31 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     }
     sum=vaddvq_s32(acc);
 #endif
+#elif defined(__riscv_vector)
+    /* RVV 1.0 tier (SpacemiT K3 / X100, VLEN=256). The core has no integer
+     * dot-product instruction (no Zvdot), so the exact int8 dot is widen-mul
+     * (i8 x i8 -> i16; |w*x| <= 16256 never overflows) plus a widening
+     * reduction i16 -> i32 per chunk. On the K3 this "reduce per chunk"
+     * shape measured 2.2x the scalar tier (bench/rvv_idot_micro.c): unlike
+     * the vwadd accumulator chains it keeps the cross-chunk dependency on a
+     * single lane-0 seed instead of a full-vector chain. Two independent
+     * reduction chains break that chain as well; integer sums are
+     * associative, so the result stays bit-identical to the scalar reference.
+     * vsetvl consumes the tail, so the scalar loop below runs zero times. */
+    {
+        vint32m1_t ra=__riscv_vmv_v_x_i32m1(0,1), rb=ra;
+        int k=0;
+        for(;i<I;k++){
+            size_t vl=__riscv_vsetvl_e8m4(I-i);
+            vint8m4_t  wv=__riscv_vle8_v_i8m4(w+i,vl);
+            vint8m4_t  xv=__riscv_vle8_v_i8m4(x+i,vl);
+            vint16m8_t p =__riscv_vwmul_vv_i16m8(wv,xv,vl);
+            if(k&1) rb=__riscv_vwredsum_vs_i16m8_i32m1(p,rb,vl);
+            else    ra=__riscv_vwredsum_vs_i16m8_i32m1(p,ra,vl);
+            i+=(int)vl;
+        }
+        sum=__riscv_vmv_x_s_i32m1_i32(ra)+__riscv_vmv_x_s_i32m1_i32(rb);
+    }
 #elif defined(__VSX__)
     __vector signed int acc=vec_splats(0);
     const __vector signed char vz=vec_splats((signed char)0);
@@ -283,6 +373,38 @@ static inline void dot_i8i8_rows(const int8_t *w, const int8_t *x, int I, int n,
         }
     }
     for(int r=0;r<n;r++) out[r]=hsum256_i32(acc[r]);
+#elif defined(__riscv_vector)
+    /* RVV tier: one shared weight load per chunk, then one widen-mul + widen-
+     * reduce chain per activation row (the MTP-verify shape pays w's load once).
+     * m2 chunks keep register pressure low with n chains live; exact like the
+     * single-row kernel (associative integer sums). RVV types cannot be arrays,
+     * so the 1..4 rows are unrolled behind n. */
+    {
+        vint32m1_t ra0=__riscv_vmv_v_x_i32m1(0,1), rb0=ra0;
+        vint32m1_t ra1=ra0, rb1=ra0, ra2=ra0, rb2=ra0, ra3=ra0, rb3=ra0;
+        int k=0;
+        for(;i<I;k++){
+            size_t vl=__riscv_vsetvl_e8m2(I-i);
+            vint8m2_t wv=__riscv_vle8_v_i8m2(w+i,vl);
+            vint8m2_t xv; vint16m4_t p;
+#define COLI_RVV_ROWS_ACC(ra,rb,xoff) do{                                      \
+            xv=__riscv_vle8_v_i8m2(x+(size_t)(xoff)*I+i,vl);                    \
+            p =__riscv_vwmul_vv_i16m4(wv,xv,vl);                               \
+            if(k&1) (rb)=__riscv_vwredsum_vs_i16m4_i32m1(p,(rb),vl);           \
+            else    (ra)=__riscv_vwredsum_vs_i16m4_i32m1(p,(ra),vl);           \
+        }while(0)
+            COLI_RVV_ROWS_ACC(ra0,rb0,0);
+            if(n>1) COLI_RVV_ROWS_ACC(ra1,rb1,1);
+            if(n>2) COLI_RVV_ROWS_ACC(ra2,rb2,2);
+            if(n>3) COLI_RVV_ROWS_ACC(ra3,rb3,3);
+#undef COLI_RVV_ROWS_ACC
+            i+=(int)vl;
+        }
+        out[0]=__riscv_vmv_x_s_i32m1_i32(ra0)+__riscv_vmv_x_s_i32m1_i32(rb0);
+        if(n>1) out[1]=__riscv_vmv_x_s_i32m1_i32(ra1)+__riscv_vmv_x_s_i32m1_i32(rb1);
+        if(n>2) out[2]=__riscv_vmv_x_s_i32m1_i32(ra2)+__riscv_vmv_x_s_i32m1_i32(rb2);
+        if(n>3) out[3]=__riscv_vmv_x_s_i32m1_i32(ra3)+__riscv_vmv_x_s_i32m1_i32(rb3);
+    }
 #else
     for(int r=0;r<n;r++) out[r]=dot_i8i8(w,x+(size_t)r*I,I);
     i=I;
@@ -427,6 +549,40 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
                      (__vector unsigned char)vec_sel(w1,vec_sub(vz,w1),n1),acc);
     }
     sum=vec_extract(acc,0)+vec_extract(acc,1)+vec_extract(acc,2)+vec_extract(acc,3);
+#elif defined(__riscv_vector)
+    /* RVV tier (K3 / X100): lane-local nibble assemble -- byte j of the packed
+     * pair layout holds (e_2j, e_2j+1); zero-extending it to u16 and computing
+     * (t & 0x0F) | ((t & 0xF0) << 4) puts e_2j at bits 0..3 and e_2j+1 at
+     * bits 8..11 of the same 16-bit lane, so the i8 view is exactly the element
+     * order [e_2j, e_2j+1] with no cross-lane shuffle. One i8-wide vsub folds
+     * in the nibble offset (bytes are per-lane, no borrow). Then widen-mul +
+     * widening reduction like dot_i8i8: measured 6.3x the scalar tier on the
+     * K3 (bench/rvv_idot_micro.c), still bit-identical (integer sums).
+     * The loop walks the even part of I (both avl and vlmax(e8m2) are even,
+     * so vl is even and nb = vl/2 bytes cover it exactly); one scalar step of
+     * the tail below closes an odd I. */
+    {
+        int even=I&~1;
+        vint32m1_t ra=__riscv_vmv_v_x_i32m1(0,1), rb=ra;
+        int k=0;
+        for(;i<even;k++){
+            size_t vl=__riscv_vsetvl_e8m2(even-i);
+            size_t nb=vl/2;
+            vuint8m1_t  b8=__riscv_vle8_v_u8m1(w4+(i>>1),nb);
+            vuint16m2_t t =__riscv_vzext_vf2_u16m2(b8,nb);
+            vuint16m2_t n =__riscv_vor_vv_u16m2(
+                __riscv_vand_vx_u16m2(t,0x0F,nb),
+                __riscv_vsll_vx_u16m2(__riscv_vand_vx_u16m2(t,0xF0,nb),4,nb),nb);
+            vint8m2_t wv=__riscv_vsub_vx_i8m2(
+                __riscv_vreinterpret_v_u8m2_i8m2(__riscv_vreinterpret_v_u16m2_u8m2(n)),8,vl);
+            vint8m2_t xv=__riscv_vle8_v_i8m2(x+i,vl);
+            vint16m4_t p=__riscv_vwmul_vv_i16m4(wv,xv,vl);
+            if(k&1) rb=__riscv_vwredsum_vs_i16m4_i32m1(p,rb,vl);
+            else    ra=__riscv_vwredsum_vs_i16m4_i32m1(p,ra,vl);
+            i+=(int)vl;
+        }
+        sum=__riscv_vmv_x_s_i32m1_i32(ra)+__riscv_vmv_x_s_i32m1_i32(rb);
+    }
 #endif
     for(;i+1<I;i+=2){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
     if(i<I){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]; }

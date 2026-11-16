@@ -524,6 +524,20 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
     return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
 }
 #define HAVE_FAST_DOT_I8 1
+#elif defined(__riscv_vector)
+#include <riscv_vector.h>
+/* RVV counterpart (SpacemiT K3 / X100, no Zvdot on this core): widen-mul
+ * i8 x i8 -> i16 (never overflows) plus a widening reduction i16 -> i32,
+ * the shape idot.h's dot_i8i8 uses. Pure integer arithmetic, so THIS DOT is
+ * bit-for-bit identical to a scalar int8 dot, same as the tiers above. */
+static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
+    size_t vl = __riscv_vsetvl_e8m2(16);
+    vint8m2_t  va = __riscv_vle8_v_i8m2(a, vl), vb = __riscv_vle8_v_i8m2(b, vl);
+    vint16m4_t p  = __riscv_vwmul_vv_i16m4(va, vb, vl);
+    return __riscv_vmv_x_s_i32m1_i32(
+        __riscv_vwredsum_vs_i16m4_i32m1(p, __riscv_vmv_v_x_i32m1(0, 1), vl));
+}
+#define HAVE_FAST_DOT_I8 1
 #endif
 /* Test-only hook, compiled out of the shipping binary.
  *

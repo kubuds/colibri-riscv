@@ -57,6 +57,7 @@ endif
 X86_64  := $(filter x86_64 amd64,$(TARGET_CPU))
 AARCH64 := $(filter aarch64 arm64,$(TARGET_CPU))
 PPC64   := $(filter powerpc64% ppc64%,$(TARGET_CPU))
+RISCV64 := $(filter riscv64 riscv,$(TARGET_CPU))
 
 ifneq (,$(DARWIN))
 # --- macOS / Apple Silicon ---
@@ -207,6 +208,28 @@ else ifneq (,$(filter armv%,$(ARCH)))
 ARCHFLAG := -march=$(ARCH)
 else
 ARCHFLAG := -mcpu=$(ARCH)
+endif
+CFLAGS  = -O3 $(ARCHFLAG) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
+ifeq ($(LTO),1)
+CFLAGS  += -flto
+LDFLAGS += -flto
+endif
+EXE     =
+else ifneq (,$(RISCV64))
+# --- Linux riscv64 (SpacemiT K3: 8x X100, RVA23 + RVV 1.0, VLEN=256) ---
+# The X100 core is RVA23: RVV 1.0 is mandatory and the silicon runs VLEN=256
+# with ELEN=64. ARCH=spacemit-x100 (default) asks gcc (Bianbu >= 13) for the
+# full core model: it turns on V plus Zvbb/Zvfh/Zvfbfmin/Zvfbfwma, which is
+# what unlocks the __riscv_vector tiers in idot.h / gsgemv.h / st.h and the
+# bf16/f16 compute paths. ARCH=generic builds the plain scalar tiers only
+# (rv64gc, no V). Any other ARCH value is passed to -mcpu as-is.
+CC      = gcc
+ARCH   ?= spacemit-x100
+ifneq ($(ARCH),generic)
+ARCHFLAG := -mcpu=$(ARCH)
+else
+ARCHFLAG := -march=rv64gc
 endif
 CFLAGS  = -O3 $(ARCHFLAG) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
 LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
@@ -1928,6 +1951,10 @@ else ifneq (,$(AARCH64))
 PORTABLE_ARCH = armv8-a
 else ifneq (,$(PPC64))
 PORTABLE_ARCH = power8
+else ifneq (,$(RISCV64))
+# portable on riscv64 = the no-V scalar baseline; the tuned K3 build is the
+# default ARCH=spacemit-x100 (make colibri / make test without ARCH=).
+PORTABLE_ARCH = generic
 else ifneq (,$(X86_64))
 PORTABLE_ARCH = x86-64-v3
 else
@@ -3143,6 +3170,17 @@ tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c colibri.c $(VK_OBJ)
 # bench_matmul_f32: microbenchmark (pre-#442 scalar vs row-blocked fmaf f32 matmul at
 # router shapes), NOT a test gate. Build on demand: make tests/bench_matmul_f32
 tests/bench_matmul_f32$(EXE): tests/bench_matmul_f32.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_rvv_idot / bench_rvv_gsgemv: real-kernel throughput on RISC-V (SpacemiT
+# K3, X100), NOT test gates. Build twice to compare the tiers on one machine:
+#   make tests/bench_rvv_idot tests/bench_rvv_gsgemv                  (RVV tiers)
+#   make tests/bench_rvv_idot tests/bench_rvv_gsgemv ARCH=generic     (scalar)
+tests/bench_rvv_idot$(EXE): tests/bench_rvv_idot.c idot.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_rvv_gsgemv$(EXE): tests/bench_rvv_gsgemv.c gsgemv.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_rvv_idot_shapes$(EXE): tests/bench_rvv_idot_shapes.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # bench_attn_f32: microbenchmark (one decode token's attention core in qwen36,

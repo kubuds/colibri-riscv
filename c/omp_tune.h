@@ -292,12 +292,23 @@ static void coli_omp_hot_team(char **argv, const char *engine, int gpu_on)
 #ifdef __linux__
 #ifdef CPU_SETSIZE
     {   /* #471: a user's OMP_PROC_BIND already bound this thread to one place; the new image
-         * would inherit that mask and put its whole team there */
+         * would inherit that mask and put its whole team there.
+         * SpacemiT K3 and other asymmetric SoCs: not every online hart is schedulable
+         * for an ordinary process (K3: 8x X100 + 8x A100 online, the A100 half answers
+         * sched_setaffinity with EINVAL), so the all-online mask is refused as a whole
+         * and the re-exec would run with the stale pin. Grow the mask one CPU at a time
+         * and keep what sticks: the widest set this process may actually use. */
         cpu_set_t all; CPU_ZERO(&all);
         long n = sysconf(_SC_NPROCESSORS_ONLN);
         if (n > CPU_SETSIZE) n = CPU_SETSIZE;
         for (long i = 0; i < n; i++) CPU_SET((int)i, &all);
-        if (sched_setaffinity(0, sizeof all, &all) != 0) perror("[OMP] sched_setaffinity before the re-exec (continuing)");
+        if (sched_setaffinity(0, sizeof all, &all) != 0) {
+            cpu_set_t cur; CPU_ZERO(&cur);
+            for (long i = 0; i < n; i++) {
+                cpu_set_t try = cur; CPU_SET((int)i, &try);
+                if (sched_setaffinity(0, sizeof try, &try) == 0) cur = try;
+            }
+        }
     }
 #endif
     char self[4096];
