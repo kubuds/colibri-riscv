@@ -24,7 +24,7 @@
 #if (defined(__AVX2__) && defined(__FMA__)) || defined(__SSE4_1__)
 #include <immintrin.h>
 #endif
-#if defined(__riscv_vector)
+#if defined(__riscv_vector) && !defined(COLI_NO_RVV)
 #include <riscv_vector.h>
 #endif
 #if defined(__SSE4_1__)
@@ -50,7 +50,7 @@ static inline float gs_group_sum_sse41(__m128 a0, __m128 a1) {
     a0 = _mm_add_ss(a0, _mm_shuffle_ps(a0,a0,1));
     return _mm_cvtss_f32(a0);
 }
-#elif defined(__riscv_vector)
+#elif defined(__riscv_vector) && !defined(COLI_NO_RVV)
 /* RVV group fold (SpacemiT K3 / X100): add the two chunk accumulators and
  * reduce with vfredusum -- an unordered sum, a genuinely different shape than
  * the scalar tier's sequential fold, exactly like the SSE4.1 tier above. */
@@ -207,7 +207,7 @@ static void matmul_q_gs(float *y, const float *x, const int8_t *q, const float *
         }
         return;
     }
-#elif defined(__riscv_vector)
+#elif defined(__riscv_vector) && !defined(COLI_NO_RVV)
     {   /* RVV tier (SpacemiT K3 / X100, VLEN=256): the SSE4.1 tier's shape at
          * full vector width -- four output rows in flight, two chunk
          * accumulators per row, one pinned fmaf per group. The int8 weights

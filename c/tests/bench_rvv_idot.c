@@ -25,7 +25,7 @@ static uint32_t xr(void) { rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5; return
 #define N_REPEAT 20000
 
 static int8_t  W[I_DIM + 64] __attribute__((aligned(64)));
-static int8_t  X[I_DIM + 64] __attribute__((aligned(64)));
+static int8_t  X[4 * I_DIM + 64] __attribute__((aligned(64)));   /* dot_i8i8_rows reads up to n rows */
 static uint8_t W4[I_DIM / 2 + 64] __attribute__((aligned(64)));
 static int8_t  XQ[I_DIM + 64] __attribute__((aligned(64)));
 static float   XF[I_DIM + 64] __attribute__((aligned(64)));
@@ -94,7 +94,8 @@ static double bench_qrow(float (*f)(const float *, int8_t *, int)) {
 int main(void) {
     const char *tier = IDOT_KERNEL;
     for (int i = 0; i < I_DIM; i++) XF[i] = ((float)(xr() % 2001) - 1000.f) / 500.f;
-    for (int i = 0; i < I_DIM; i++) { X[i] = (int8_t)((int)(xr() % 255) - 127); W[i] = (int8_t)((int)(xr() % 256) - 128); }
+    for (int i = 0; i < 4 * I_DIM; i++) X[i] = (int8_t)((int)(xr() % 255) - 127);
+    for (int i = 0; i < I_DIM; i++) W[i] = (int8_t)((int)(xr() % 256) - 128);
     for (int i = 0; i < (I_DIM + 1) / 2; i++) W4[i] = (uint8_t)(xr() & 0xFF);
     printf("idot.h kernels tier=%s (I=%d, single core)\n", tier, I_DIM);
 

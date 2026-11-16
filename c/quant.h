@@ -20,7 +20,7 @@
 #include "sse41_kernels.h"
 #endif
 
-#if defined(__riscv_vector)
+#if defined(__riscv_vector) && !defined(COLI_NO_RVV)
 /* RVV helpers (SpacemiT K3 / X100, VLEN=256) shared by the f32 GEMV tiers
  * below. New reduction shapes like the NEON tier: the float tests check them
  * with tolerance against the double reference (tests/test_olmoe_matmul_q.c),
@@ -112,7 +112,7 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
             for(;i+8<=I;i+=8){ __m256i wi=_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(w+i)));
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i), _mm256_cvtepi32_ps(wi), acc); }
             a=hsum256(acc);
-#elif defined(__riscv_vector)
+#elif defined(__riscv_vector) && !defined(COLI_NO_RVV)
             {   /* RVV tier (K3/X100): widen the int8 weights to f32 and vfmacc
                  * against the activation; two chunk accumulators, vsetvl tail. */
                 size_t vz=__riscv_vsetvlmax_e32m2();
@@ -160,7 +160,7 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
                 acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
             a=hsum256(acc);
-#elif defined(__riscv_vector)
+#elif defined(__riscv_vector) && !defined(COLI_NO_RVV)
             {   /* RVV tier (K3/X100): the lane-local nibble assemble of
                  * dot_i4i8 (idot.h) into f32 weights, then vfmacc against the
                  * activation; two chunk accumulators, vsetvl tail, and the
@@ -216,7 +216,11 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
  * already produced) on every compiler. Cheap: no instruction is emitted. */
 static inline float coli_fp_pin(float x){
 #if defined(__GNUC__)
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("" : "+x"(x));   /* SSE register; "+f" is x87 on x86 */
+#else
     __asm__ volatile("" : "+f"(x));
+#endif
 #endif
     return x;
 }
@@ -301,7 +305,7 @@ static void matmul_i4_pair(float *yg, float *yu, const float *x,
             acc=_mm256_fmadd_ps(_mm256_loadu_ps(x+i),w0,acc);
             acc=_mm256_fmadd_ps(_mm256_loadu_ps(x+i+8),w1,acc); }
         a=hsum256(acc);
-#elif defined(__riscv_vector)
+#elif defined(__riscv_vector) && !defined(COLI_NO_RVV)
         {   /* RVV tier (K3/X100): same shape as matmul_i4's RVV branch --
              * lane-local nibble assemble (idot.h) to f32, vfmacc, vsetvl tail. */
             int even=I&~1;

@@ -3176,9 +3176,9 @@ tests/bench_matmul_f32$(EXE): tests/bench_matmul_f32.c
 # K3, X100), NOT test gates. Build twice to compare the tiers on one machine:
 #   make tests/bench_rvv_idot tests/bench_rvv_gsgemv                  (RVV tiers)
 #   make tests/bench_rvv_idot tests/bench_rvv_gsgemv ARCH=generic     (scalar)
-tests/bench_rvv_idot$(EXE): tests/bench_rvv_idot.c idot.h
+tests/bench_rvv_idot$(EXE): tests/bench_rvv_idot.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-tests/bench_rvv_gsgemv$(EXE): tests/bench_rvv_gsgemv.c gsgemv.h
+tests/bench_rvv_gsgemv$(EXE): tests/bench_rvv_gsgemv.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/bench_rvv_idot_shapes$(EXE): tests/bench_rvv_idot_shapes.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

@@ -524,7 +524,7 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
     return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
 }
 #define HAVE_FAST_DOT_I8 1
-#elif defined(__riscv_vector)
+#elif defined(__riscv_vector) && !defined(COLI_NO_RVV)
 #include <riscv_vector.h>
 /* RVV counterpart (SpacemiT K3 / X100, no Zvdot on this core): widen-mul
  * i8 x i8 -> i16 (never overflows) plus a widening reduction i16 -> i32,

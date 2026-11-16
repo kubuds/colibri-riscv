@@ -29,7 +29,7 @@ static float   SC[(size_t)O_MAX * (I_MAX / 64 + 1)];
 static float   Y[O_MAX];
 
 int main(void) {
-#if defined(__riscv_vector)
+#if defined(__riscv_vector) && !defined(COLI_NO_RVV)
     const char *tier = "rvv";
 #elif defined(__AVX2__)
     const char *tier = "avx2";

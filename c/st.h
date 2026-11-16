@@ -169,7 +169,7 @@ static inline float f16_to_f32(uint16_t h) {
 #if defined(__AVX2__) || defined(__SSE4_1__)
 #include <immintrin.h>
 #endif
-#if defined(__riscv_vector)
+#if defined(__riscv_vector) && !defined(COLI_NO_RVV)
 #include <riscv_vector.h>
 #endif
 
@@ -214,7 +214,7 @@ static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
     }
     for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
 }
-#elif defined(__riscv_vector)
+#elif defined(__riscv_vector) && !defined(COLI_NO_RVV)
 /* RVV tiers (SpacemiT K3 / X100, RVV 1.0 + Zvfbfmin/Zvfhmin).
  * BF16 -> F32 is the same exact zero-pad widening as every other tier:
  * zero-extend the u16 and shift left 16 -- no arithmetic, every bit pattern

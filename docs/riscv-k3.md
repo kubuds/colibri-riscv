@@ -75,13 +75,24 @@ the f16/convert lessons where the contract allows.
 * widen-reduce `i16 → i32` per chunk (`vwredsum`, seeds a single lane),
 * two independent reduction chains per dot to break the lane-0 dependency.
 
-Measured on one X100 core, I = 4096 (`bench/rvv_idot_micro.c`, exactness
-checked bit-for-bit against the scalar reference at 17 sizes before timing):
+Measured on one X100 core, I = 4096 (`tests/bench_rvv_idot`, exactness
+checked bit-for-bit against the scalar reference at 17 sizes before
+timing). "before" is the pre-port state — the scalar fallbacks as gcc
+auto-vectorizes them under the same `-mcpu=spacemit-x100` build
+(`COLI_NO_RVV` is the A/B kill switch), "after" is the explicit RVV tier:
 
-| kernel | scalar | RVV | speedup |
+| kernel | before | RVV | speedup |
 |---|---|---|---|
-| `dot_i8i8` | 728 ns | **334 ns** | 2.2× |
-| `dot_i4i8` (packed int4) | 5533 ns | **881 ns** | 6.3× |
+| `dot_i8i8` | 725 ns | **333 ns** | 2.2× |
+| `dot_i8i8_rows` n=3 | 2181 ns | **335 ns** | 6.5× |
+| `dot_i4i8` (packed int4) | 2419 ns | **877 ns** | 2.8× |
+| `qrow_i8` (activation quantize) | 60306 ns | **2405 ns** | 25× |
+
+(Without auto-vectorization — `ARCH=generic`, the pure scalar tier — the
+same dots take 4838/18487/5213 ns. `qrow_i8`'s scalar loop cannot
+auto-vectorize at all: `lrintf` blocks it, hence the 25×.) The multi-row
+dot pays the weight load once for all rows: three rows for the price of
+one.
 
 The micro-benchmark rejected the "obvious" shapes: `vwadd` accumulator chains
 were *slower* than scalar (uop-heavy widening adds; 4 accumulators helped a
@@ -98,9 +109,13 @@ with no cross-lane shuffle. One per-lane i8 `vsub` folds in the nibble
 offset. (This is the vector analogue of the `unpacklo/hi` pairs the x86
 kernels pay for.)
 
-`qrow_i8` / `dense_act_i8` (activation quantization): `vfredmax` for the
-amax, `vfncvt` (round-to-nearest-even, same as `lrintf`) + `vncvt` for the
-quantize, `vwredsum` for the 64-element block sums.
+`qrow_i8` / `dense_act_i8` (activation quantization): an elementwise
+`vfmax` chain for the amax with one `vfredmax` at the end, `vfncvt`
+(round-to-nearest-even, same as `lrintf`) + `vncvt` for the quantize at
+LMUL m4, `vwredsum` for the 64-element block sums. Chunk width matters:
+the first cut used m1/mf2 chunks with per-chunk reductions and measured
+10× slower on the X100 — small `vl` loops plus reduction latency, the
+same pathology the micro-benchmark saw in the `vwadd` chains.
 
 ### 3.2 `st.h` — BF16/F16 → F32 bulk conversion
 
@@ -124,14 +139,17 @@ sub-chunk tail-drop is pinned as behavior by `tests/test_gsgemv.c` P5), the
 RVV tier carries every tail through `vsetvl`. Like the SSE4.1 tier it is a
 new reduction shape (`vfredusum` is unordered) and is checked by tolerance.
 
-One X100 core, the two expert shapes qwen36 runs (`bench_rvv_gsgemv`,
-scalar build vs RVV build of the same source):
+One X100 core, the two expert shapes qwen36 runs (`tests/bench_rvv_gsgemv`,
+pre-port scalar tier vs RVV tier of the same source):
 
-| shape | scalar | RVV | speedup |
+| shape | before | RVV | speedup |
 |---|---|---|---|
-| gate/up I=2048 O=512 gs=64 | 3279 ns/row | **1114 ns/row** | 2.9× |
-| down I=512 O=2048 gs=64 | 822 ns/row | **257 ns/row** | 3.2× |
-| ragged I=2000 O=512 gs=64 | 3188 ns/row | **987 ns/row** | 3.2× |
+| gate/up I=2048 O=512 gs=64 | 3846 ns/row | **964 ns/row** | 4.0× |
+| down I=512 O=2048 gs=64 | 962 ns/row | **243 ns/row** | 4.0× |
+| ragged I=2000 O=512 gs=64 | 3840 ns/row | **937 ns/row** | 4.1× |
+
+Eight X100 cores (the engine's OpenMP team inside `matmul_q_gs`), down
+shape: 549 → **33 ns/row** (the 4× kernel win plus near-linear scaling).
 
 ### 3.4 `quant.h` / `olmoe.c` — the default f32 GEMV paths
 
@@ -163,18 +181,25 @@ so no x86 bits move.
 
 ## 4. Validation on the K3
 
-Everything below runs on the K3 itself:
+Everything below runs on the K3 itself (`k3pico16g.local`):
 
-* `make test-c` — the full C suite (233 test binaries), including the
-  bit-exactness gates: `test_idot` (kernel + driver exactness on the RVV
-  path), `test_st_f16_bf16_simd` (exhaustive 65536-pattern conversion
-  sweep), `test_i4_grouped` (fused-vs-unfused twins), `test_gsgemv`,
-  `test_qwen36_tier_fp8` (uploader affinity widen), and the rest.
-* `make test-python` — the tiny-model end-to-end oracles (generated
-  fixtures + token-exact engine runs).
+* `make test-c` — the full C suite (233 test binaries): **all pass**,
+  including the bit-exactness gates: `test_idot` (kernel + driver
+  exactness on the RVV path), `test_int_kernel_exact` (10544 checks
+  through the planar/pair IDOT matmuls), `test_st_f16_bf16_simd`
+  (exhaustive 65536-pattern conversion sweep), `test_i4_grouped`
+  (fused-vs-unfused twins), `test_gsgemv`, `test_qwen36_tier_fp8`
+  (uploader affinity widen), and the rest.
+* `make test-python` — 3007 tiny-model end-to-end tests (generated
+  fixtures, token-exact engine runs, serve harnesses): **all pass**
+  (7 of them needed the `safetensors` pip package on the K3 image; one
+  stderr line — `[oracle] token validation FAILED` — is the expected
+  output of a negative unit test that checks exit-code propagation).
 * `tests/bench_rvv_idot`, `tests/bench_rvv_gsgemv` — the real-kernel
-  micro-benchmarks quoted above (build twice, `ARCH=generic` for the
-  scalar tier).
+  micro-benchmarks quoted above. Each bench builds twice for the A/B:
+  the default (RVV tiers) and `EXTRA_CFLAGS=-DCOLI_NO_RVV` (the pre-port
+  regime: scalar tiers under the same `-mcpu=spacemit-x100`, exactly what
+  gcc auto-vectorizes).
 * `tests/bench_rvv_idot_shapes` — the design-shape micro-benchmark that
   picked the widen-mul + `vwredsum` formulation over the `vwadd`
   accumulator chains and the per-chunk redsum over LMUL variants.
